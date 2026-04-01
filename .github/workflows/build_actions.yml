@@ -1,0 +1,719 @@
+name: build-assets
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  SOLUTION_FILE: MySQLWorkbench.sln
+  MAIN_CSPROJ: frontend/windows/MySQLWorkbench/MySQLWorkbench.csproj
+  CONFIGURATION: Release
+  PLATFORM: x64
+
+jobs:
+  validate:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Validate solution, project, and configuration
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (!(Test-Path $env:SOLUTION_FILE)) {
+            throw "Solution file not found: $env:SOLUTION_FILE"
+          }
+
+          if (!(Test-Path $env:MAIN_CSPROJ)) {
+            throw "Main project file not found: $env:MAIN_CSPROJ"
+          }
+
+          if (!(Test-Path "PrepareOutputDir.cmd")) {
+            throw "PrepareOutputDir.cmd is required by the MySQLWorkbench post-build step."
+          }
+
+          $solutionText = Get-Content $env:SOLUTION_FILE -Raw
+          $projectText = Get-Content $env:MAIN_CSPROJ -Raw
+
+          if ($solutionText -notmatch [regex]::Escape('Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MySQLWorkbench", "frontend\windows\MySQLWorkbench\MySQLWorkbench.csproj"')) {
+            throw "MySQLWorkbench.sln does not reference frontend\windows\MySQLWorkbench\MySQLWorkbench.csproj as expected."
+          }
+
+          if ($solutionText -notmatch '(?m)^\s*Release\|x64 = Release\|x64\s*$') {
+            throw "Solution configuration Release|x64 is missing from MySQLWorkbench.sln."
+          }
+
+          if ($solutionText -notmatch '\.Release\|x64\.Build\.0 = Release\|x64') {
+            throw "Release|x64 is not marked as a buildable solution configuration."
+          }
+
+          if ($projectText -notmatch '(?s)<PropertyGroup Condition="''\$\(Configuration\)\|\$\(Platform\)'' == ''Release\|x64''">.*?<OutputPath>\.\.\\\.\.\\\.\.\\bin\\x64\\Release\\</OutputPath>') {
+            throw "frontend/windows/MySQLWorkbench/MySQLWorkbench.csproj does not define Release|x64."
+          }
+
+          if ($projectText -notmatch '<TargetFrameworkVersion>v4\.5</TargetFrameworkVersion>') {
+            throw "MySQLWorkbench.csproj no longer targets .NET Framework 4.5; update the workflow accordingly."
+          }
+
+          if ($projectText -notmatch [regex]::Escape('call "$(SolutionDir)PrepareOutputDir.cmd" $(SolutionDir) $(ConfigurationName) $(PlatformTarget)')) {
+            throw "Expected PrepareOutputDir.cmd post-build invocation was not found in MySQLWorkbench.csproj."
+          }
+
+      - name: Validate hosted toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $null = Get-Command msbuild -ErrorAction Stop
+          $null = Get-Command nuget -ErrorAction Stop
+          $null = Get-Command java -ErrorAction Stop
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (!(Test-Path $vswhere)) {
+            throw "vswhere.exe was not found at $vswhere"
+          }
+
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+          if (-not $vsPath) {
+            throw "Unable to locate a Visual Studio installation with MSBuild."
+          }
+
+          $toolset = Get-ChildItem (Join-Path $vsPath "MSBuild\Microsoft\VC") -Recurse -Filter Toolset.props |
+            Where-Object { $_.FullName -match '[\\/]v142[\\/].*Toolset\.props$' } |
+            Select-Object -First 1
+
+          if (-not $toolset) {
+            throw "Visual Studio v142 toolset was not found on the hosted runner."
+          }
+
+      - name: Restore NuGet packages
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          nuget restore $env:SOLUTION_FILE
+
+      - name: Summarize validation outcome
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          @"
+          Validation passed for:
+          - Solution: $env:SOLUTION_FILE
+          - Main project: $env:MAIN_CSPROJ
+          - Configuration/platform: $env:CONFIGURATION|$env:PLATFORM
+          - Hosted prerequisites: MSBuild, NuGet, Java, .NET Framework 4.5 reference assemblies, Visual Studio v142 toolset
+
+          Build assumptions carried into the next job:
+          - The workflow assembles the expected WB_3DPARTY_PATH layout inside CI from package-manager steps.
+          - vsqlite++ source is not present in this repository, so the build job creates a compatibility shim for that legacy import if no real binary is available.
+          - Some runtime-only files copied by PrepareOutputDir.cmd are best-effort because missing copies there do not stop compilation.
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+  build:
+    needs: validate
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up MSVC developer command prompt
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: "x64"
+
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Install .NET Framework 4.5 reference assemblies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          nuget install Microsoft.NETFramework.ReferenceAssemblies.net45 `
+            -OutputDirectory tools `
+            -ExcludeVersion
+
+          $src = Join-Path $PWD "tools\Microsoft.NETFramework.ReferenceAssemblies.net45\build\.NETFramework\v4.5"
+          $dst = "C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.5"
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          Copy-Item -Path (Join-Path $src "*") -Destination $dst -Recurse -Force
+
+      - name: Restore NuGet packages
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          nuget restore $env:SOLUTION_FILE
+
+      - name: Install Python runtime packages used by packaging
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -m pip install --upgrade pip
+          python -m pip install pyodbc
+
+      - name: Install SWIG
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          choco install swig --yes --no-progress
+          $null = Get-Command swig -ErrorAction Stop
+
+      - name: Bootstrap vcpkg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          git clone https://github.com/microsoft/vcpkg.git "$env:RUNNER_TEMP\vcpkg"
+          & "$env:RUNNER_TEMP\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
+
+          "VCPKG_ROOT=$env:RUNNER_TEMP\vcpkg" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "WB_3DPARTY_PATH=$env:RUNNER_TEMP\wb-3rdparty" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+
+      - name: Prepare vcpkg binary cache
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path C:\vcpkg-bincache | Out-Null
+          "VCPKG_DEFAULT_BINARY_CACHE=C:\vcpkg-bincache" | Out-File $env:GITHUB_ENV -Append
+          "VCPKG_BINARY_SOURCES=clear;files,C:\vcpkg-bincache,readwrite" | Out-File $env:GITHUB_ENV -Append
+          "VCPKG_PLATFORM_TOOLSET=v143" | Out-File $env:GITHUB_ENV -Append
+
+      - name: Restore vcpkg binary cache
+        id: vcpkg-cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: C:\vcpkg-bincache
+          key: vcpkg-bincache-${{ runner.os }}-x64-workbench-v3
+          restore-keys: |
+            vcpkg-bincache-${{ runner.os }}-x64-
+
+      # - name: Change mysql-connector-cpp to v142
+      #   shell: pwsh
+      #   run: |
+      #     Remove-Item -Recurse -Force "$env:VCPKG_ROOT\buildtrees\mysql-connector-cpp" -ErrorAction SilentlyContinue
+      #     Remove-Item -Recurse -Force "$env:VCPKG_ROOT\packages\mysql-connector-cpp_x64-windows-static*" -ErrorAction SilentlyContinue
+      #     & "$env:VCPKG_ROOT\vcpkg.exe" remove mysql-connector-cpp:x64-windows-static --recurse
+      #     & "$env:VCPKG_ROOT\vcpkg.exe" install mysql-connector-cpp[core,jdbc]:x64-windows-static-v142
+
+      - name: Install ANTLR runtime with vcpkg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          & "$env:VCPKG_ROOT\vcpkg.exe" install `
+            antlr4:x64-windows
+
+      - name: Install Boost and RapidJSON dependencies with vcpkg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          & "$env:VCPKG_ROOT\vcpkg.exe" install `
+            mysql-connector-cpp:x64-windows `
+            boost-locale:x64-windows `
+            boost-signals2:x64-windows `
+            rapidjson:x64-windows
+
+      - name: Install GDAL (and with it SQLite3) with vcpkg
+        shell: pwsh
+        run: |
+          # Note that this also installs sqlite3:x64-windows
+          $ErrorActionPreference = "Stop"
+
+          & "$env:VCPKG_ROOT\vcpkg.exe" install `
+            gdal:x64-windows
+
+      - name: Install PCRE and libzip with vcpkg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          & "$env:VCPKG_ROOT\vcpkg.exe" install `
+            pcre:x64-windows `
+            libzip:x64-windows
+
+      - name: Install libxml2 with vcpkg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          & "$env:VCPKG_ROOT\vcpkg.exe" install `
+            libxml2:x64-windows
+
+      - name: Install glib and cairo with vcpkg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          & "$env:VCPKG_ROOT\vcpkg.exe" install `
+            glib:x64-windows `
+            cairo:x64-windows
+
+      - name: Install database connectivity dependencies with vcpkg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          & "$env:VCPKG_ROOT\vcpkg.exe" install `
+            libssh:x64-windows `
+            "mysql-connector-cpp[jdbc]:x64-windows-static" `
+            libmysql:x64-windows
+
+      - name: Install HtmlRenderer assembly
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          nuget install HtmlRenderer.WinForms -OutputDirectory .gha\nuget -ExcludeVersion
+
+
+      - name: Save vcpkg binary cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: C:\vcpkg-bincache
+          key: vcpkg-bincache-${{ runner.os }}-x64-workbench-v3
+
+
+      - name: Install vsqlitepp with vcpkg overlay port
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $portDir = "$env:GITHUB_WORKSPACE\overlay-ports\vsqlitepp"
+          New-Item -ItemType Directory -Force -Path $portDir | Out-Null
+
+          @'
+          {
+            "name": "vsqlitepp",
+            "version-string": "0.3.13",
+            "description": "VSQLite++ C++ wrapper for SQLite3",
+            "homepage": "https://github.com/vinzenz/vsqlite--",
+            "license": "BSD-3-Clause",
+            "dependencies": [
+              "sqlite3"
+            ]
+          }
+          '@ | Set-Content -Path "$portDir\vcpkg.json" -Encoding UTF8NoBOM
+
+          @'
+          vcpkg_from_github(
+              OUT_SOURCE_PATH SOURCE_PATH
+              REPO vinzenz/vsqlite--
+              REF 0.3.13
+              SHA512 70fcd16348e3b2a0854b1d496c68fda7e354068aefbd6a5ad21d7a42afebd2bd746f604240475acfeebe00898ab156f9dfd687346fdf5c77d775262db3a5666e
+              HEAD_REF master
+          )
+
+          file(INSTALL
+              "${SOURCE_PATH}/include/"
+              DESTINATION "${CURRENT_PACKAGES_DIR}/include"
+              FILES_MATCHING
+                  PATTERN "*.h"
+                  PATTERN "*.hpp"
+          )
+
+          if(EXISTS "${SOURCE_PATH}/COPYING")
+              file(INSTALL
+                  "${SOURCE_PATH}/COPYING"
+                  DESTINATION "${CURRENT_PACKAGES_DIR}/share/${PORT}"
+                  RENAME copyright
+              )
+          elseif(EXISTS "${SOURCE_PATH}/LICENSE")
+              file(INSTALL
+                  "${SOURCE_PATH}/LICENSE"
+                  DESTINATION "${CURRENT_PACKAGES_DIR}/share/${PORT}"
+                  RENAME copyright
+              )
+          else()
+              message(FATAL_ERROR "Could not find COPYING or LICENSE in vsqlitepp source tree.")
+          endif()
+
+          file(REMOVE_RECURSE
+              "${CURRENT_PACKAGES_DIR}/debug"
+          )
+          '@ | Set-Content -Path "$portDir\portfile.cmake" -Encoding UTF8NoBOM
+
+          Write-Output "-- Taco2 --"
+          Get-ChildItem -Force $portDir | Format-List Name,FullName,Length
+          Write-Output "-- Taco2 --"
+
+          & "$env:VCPKG_ROOT\vcpkg.exe" install `
+            vsqlitepp:x64-windows `
+            --overlay-ports="$env:GITHUB_WORKSPACE\overlay-ports"
+
+      - name: Build WB_3DPARTY_PATH bundle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $bundle = $env:WB_3DPARTY_PATH
+          $triplets = @(
+            (Join-Path $env:VCPKG_ROOT "installed\x64-windows"),
+            (Join-Path $env:VCPKG_ROOT "installed\x64-windows-static")
+          )
+          $pythonRoot = $env:pythonLocation
+
+          $dirs = @(
+            $bundle,
+            "$bundle\bin",
+            "$bundle\include",
+            "$bundle\include\sqlite",
+            "$bundle\include\mysql",
+            "$bundle\include\cppconn",
+            "$bundle\lib",
+            "$bundle\lib\glib-2.0\include",
+            "$bundle\lib\libzip\include",
+            "$bundle\Python",
+            "$bundle\Python\Include",
+            "$bundle\Python\Lib",
+            "$bundle\Python\Libs",
+            "$bundle\Python\DLLs",
+            "$bundle\Python\site-packages"
+          )
+
+          foreach ($dir in $dirs) {
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          }
+
+          function Copy-TreeIfExists {
+            param(
+              [string]$Source,
+              [string]$Destination
+            )
+
+            if (Test-Path $Source) {
+              Write-Output "-- TACO $Source --"
+              # Get-ChildItem -Recurse $Source | Select-Object FullName
+              Get-ChildItem -Recurse D:\a\_temp -Filter database_exception.hpp | Select-Object FullName
+              Write-Output "------"
+
+              New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+              Copy-Item -Path (Join-Path $Source '*') -Destination $Destination -Recurse -Force
+            }
+          }
+
+          function Find-FirstFile {
+            param(
+              [string[]]$Roots,
+              [string[]]$Patterns
+            )
+
+            foreach ($root in $Roots) {
+              if (!(Test-Path $root)) {
+                continue
+              }
+
+              foreach ($pattern in $Patterns) {
+                $match = Get-ChildItem -Path $root -Recurse -File -Filter $pattern -ErrorAction SilentlyContinue |
+                  Select-Object -First 1
+                if ($match) {
+                  return $match.FullName
+                }
+              }
+            }
+
+            return $null
+          }
+
+          function Copy-AliasFile {
+            param(
+              [string[]]$Roots,
+              [string[]]$Patterns,
+              [string]$Destination
+            )
+
+            $source = Find-FirstFile -Roots $Roots -Patterns $Patterns
+            if (!$source) {
+              throw "Could not find any of: $($Patterns -join ', ') under $($Roots -join ', ')"
+            }
+
+            Copy-Item -Path $source -Destination $Destination -Force
+          }
+
+          foreach ($triplet in $triplets) {
+            # Copy the native dependency trees. This preserves layouts such as glib-2.0/include.
+            Copy-TreeIfExists -Source (Join-Path $triplet 'include') -Destination "$bundle\include"
+            Copy-TreeIfExists -Source (Join-Path $triplet 'lib') -Destination "$bundle\lib"
+            Copy-TreeIfExists -Source (Join-Path $triplet 'bin') -Destination "$bundle\lib"
+            Copy-TreeIfExists -Source (Join-Path $triplet 'tools\gdal') -Destination "$bundle\bin"
+
+            # Mirror the common binary tools folder too. Some ports put executables here.
+            Copy-TreeIfExists -Source (Join-Path $triplet 'tools') -Destination "$bundle\tools"
+          }
+
+          # Python runtime from setup-python. The repo explicitly expects Python 3.12 names.
+          Copy-TreeIfExists -Source (Join-Path $pythonRoot 'include') -Destination "$bundle\Python\Include"
+          Copy-TreeIfExists -Source (Join-Path $pythonRoot 'Lib') -Destination "$bundle\Python\lib"
+          Copy-TreeIfExists -Source (Join-Path $pythonRoot 'libs') -Destination "$bundle\Python\Libs"
+          Copy-TreeIfExists -Source (Join-Path $pythonRoot 'DLLs') -Destination "$bundle\Python\DLLs"
+
+          $pythonExe = Find-FirstFile -Root $pythonRoot -Patterns @('python.exe')
+          $pythonDll = Find-FirstFile -Root $pythonRoot -Patterns @('python312.dll')
+          $pythonLib = Find-FirstFile -Root $pythonRoot -Patterns @('python312.lib')
+
+          if (!$pythonExe -or !$pythonDll -or !$pythonLib) {
+            throw "Python 3.12 runtime artifacts were not found under $pythonRoot"
+          }
+
+          Copy-Item -Path $pythonExe -Destination "$bundle\Python\python.exe" -Force
+          Copy-Item -Path $pythonDll -Destination "$bundle\Python\python312.dll" -Force
+          Copy-Item -Path $pythonLib -Destination "$bundle\Python\Libs\python312.lib" -Force
+
+          $sitePackages = python -c "import site; print(site.getsitepackages()[0])"
+          $sitePackages = "$sitePackages".Trim()
+          if ($sitePackages -and (Test-Path $sitePackages)) {
+            Copy-TreeIfExists -Source $sitePackages -Destination "$bundle\Python\site-packages"
+          }
+
+          # Legacy include layouts expected by the checked-in .props files.
+          Copy-AliasFile -Roots $triplets -Patterns @('sqlite3.h') -Destination "$bundle\include\sqlite\sqlite3.h"
+          $sqliteExt = Find-FirstFile -Roots $triplets -Patterns @('sqlite3ext.h')
+          if ($sqliteExt) {
+            Copy-Item -Path $sqliteExt -Destination "$bundle\include\sqlite\sqlite3ext.h" -Force
+          }
+
+          $mysqlHeader = Find-FirstFile -Roots $triplets -Patterns @('mysql.h')
+          $mysqlHeaderDir = $null
+          if ($mysqlHeader) {
+            $mysqlHeaderDir = Split-Path $mysqlHeader -Parent
+          }
+          if (!$mysqlHeaderDir) {
+            throw "mysql.h was not found in the installed dependency tree"
+          }
+          Copy-TreeIfExists -Source $mysqlHeaderDir -Destination "$bundle\include\mysql"
+
+          $cppconnHeader = Find-FirstFile -Roots $triplets -Patterns @('driver.h')
+          $cppconnDir = $null
+          if ($cppconnHeader) {
+            $cppconnDir = Split-Path $cppconnHeader -Parent
+          }
+          if (!$cppconnDir) {
+            throw "Connector/C++ headers were not found in the installed dependency tree"
+          }
+          if ((Split-Path $cppconnDir -Leaf) -ne 'cppconn') {
+            foreach ($triplet in $triplets) {
+              $cppconnDir = Get-ChildItem -Path $triplet -Recurse -Directory -Filter cppconn -ErrorAction SilentlyContinue |
+                Select-Object -First 1 -ExpandProperty FullName
+              if ($cppconnDir) {
+                break
+              }
+            }
+          }
+          if (!$cppconnDir) {
+            throw "cppconn include directory was not found"
+          }
+          Copy-TreeIfExists -Source $cppconnDir -Destination "$bundle\include\cppconn"
+
+          if (Test-Path "$bundle\include\zipconf.h") {
+            Copy-Item -Path "$bundle\include\zipconf.h" -Destination "$bundle\lib\libzip\include\zipconf.h" -Force
+          }
+
+          # Normalize legacy library names expected by this repo.
+          Copy-AliasFile -Roots $triplets -Patterns @('antlr4-runtime.lib') -Destination "$bundle\lib\antlr4-runtime.lib"
+          Copy-AliasFile -Roots $triplets -Patterns @('cairo.lib') -Destination "$bundle\lib\cairo.lib"
+          Copy-AliasFile -Roots $triplets -Patterns @('gdal.lib') -Destination "$bundle\lib\gdal.lib"
+          Copy-AliasFile -Roots $triplets -Patterns @('glib-2.0.lib') -Destination "$bundle\lib\glib-2.0.lib"
+          Copy-AliasFile -Roots $triplets -Patterns @('gmodule-2.0.lib') -Destination "$bundle\lib\gmodule-2.0.lib"
+          Copy-AliasFile -Roots $triplets -Patterns @('gobject-2.0.lib') -Destination "$bundle\lib\gobject-2.0.lib"
+          Copy-AliasFile -Roots $triplets -Patterns @('gthread-2.0.lib') -Destination "$bundle\lib\gthread-2.0.lib"
+          Copy-AliasFile -Roots $triplets -Patterns @('libxml2.lib') -Destination "$bundle\lib\libxml2.lib"
+          Copy-AliasFile -Roots $triplets -Patterns @('pcre.lib') -Destination "$bundle\lib\pcre.lib"
+          Copy-AliasFile -Roots $triplets -Patterns @('pcrecpp.lib') -Destination "$bundle\lib\pcrecpp.lib"
+          Copy-AliasFile -Roots $triplets -Patterns @('sqlite3.lib') -Destination "$bundle\lib\sqlite3.lib"
+          Copy-AliasFile -Roots $triplets -Patterns @('ssh.lib', 'libssh.lib') -Destination "$bundle\lib\ssh.lib"
+          Copy-AliasFile -Roots $triplets -Patterns @('zip.lib') -Destination "$bundle\lib\zip.lib"
+          Copy-AliasFile -Roots $triplets -Patterns @('zlib1.lib', 'zlib.lib') -Destination "$bundle\lib\zlib1.lib"
+          Copy-AliasFile -Roots $triplets -Patterns @('libmysql.lib', 'mysqlclient.lib', 'mysql.lib') -Destination "$bundle\lib\mysqlclient.lib"
+          Copy-AliasFile -Roots $triplets -Patterns @('mysqlcppconn.lib', 'mysqlcppconn8.lib', 'mysqlcppconn-static.lib', 'mysqlcppconn8-static.lib', 'mysqlcppconn8-static-mt.lib', 'mysqlcppconn8-static-mt-mt.lib', 'mysqlcppconn*.lib') -Destination "$bundle\lib\mysqlcppconn.lib"
+
+          # Runtime DLL aliases used by PrepareOutputDir.cmd are best-effort compatibility copies.
+          $dllAliases = @(
+            @{ Patterns = @('antlr4-runtime.dll'); Destination = "$bundle\lib\antlr4-runtime.dll" }
+            @{ Patterns = @('cairo-2.dll', 'cairo.dll'); Destination = "$bundle\lib\cairo-2.dll" }
+            @{ Patterns = @('libcrypto-3-x64.dll', 'libcrypto-3.dll', 'libcrypto-3*.dll'); Destination = "$bundle\lib\libcrypto-3-x64.dll" }
+            @{ Patterns = @('libssl-3-x64.dll', 'libssl-3.dll', 'libssl-3*.dll'); Destination = "$bundle\lib\libssl-3-x64.dll" }
+            @{ Patterns = @('libxml2.dll'); Destination = "$bundle\lib\libxml2.dll" }
+            @{ Patterns = @('iconv.dll', 'libiconv.dll'); Destination = "$bundle\lib\iconv.dll" }
+            @{ Patterns = @('libpng16.dll', 'libpng16*.dll'); Destination = "$bundle\lib\libpng16.dll" }
+            @{ Patterns = @('pixman-1-0.dll', 'pixman*.dll'); Destination = "$bundle\lib\pixman-1-0.dll" }
+            @{ Patterns = @('sqlite3.dll'); Destination = "$bundle\lib\sqlite3.dll" }
+            @{ Patterns = @('zlib1.dll', 'zlib.dll'); Destination = "$bundle\lib\zlib.dll" }
+            @{ Patterns = @('ssh.dll', 'libssh.dll'); Destination = "$bundle\lib\ssh.dll" }
+            @{ Patterns = @('zip.dll'); Destination = "$bundle\lib\zip.dll" }
+            @{ Patterns = @('gdal*.dll'); Destination = $null }
+          )
+
+          foreach ($dllAlias in $dllAliases) {
+            $source = Find-FirstFile -Roots $triplets -Patterns $dllAlias.Patterns
+            if ($source) {
+              $destination = $dllAlias.Destination
+              if (!$destination) {
+                $destination = Join-Path "$bundle\lib" (Split-Path $source -Leaf)
+              }
+              Copy-Item -Path $source -Destination $destination -Force
+            }
+          }
+
+          # HTML renderer assembly for the managed wrapper project.
+          $htmlRenderer = Find-FirstFile -Root (Join-Path $PWD '.gha\nuget') -Patterns @('HtmlRenderer.dll')
+          if (!$htmlRenderer) {
+            throw "HtmlRenderer.dll was not restored from NuGet"
+          }
+          Copy-Item -Path $htmlRenderer -Destination "$bundle\lib\HtmlRenderer.dll" -Force
+
+          # ANTLR jar is required by library/parsers/grammars/build-parsers.cmd.
+          Invoke-WebRequest `
+            -Uri "https://www.antlr.org/download/antlr-4.13.2-complete.jar" `
+            -OutFile "$bundle\bin\antlr-4.13.2-complete.jar"
+
+          Write-Host "=== Connector/C++ files under vcpkg ==="
+          Get-ChildItem -Recurse "D:\a\_temp\vcpkg\installed\x64-windows" -Include *.lib,*.dll |
+            Where-Object { $_.Name -match 'mysqlcppconn' } |
+            Sort-Object FullName |
+            Select-Object FullName, Name
+
+          # Copy JDBC connector DLL if present so the output bundle has a matching runtime library.
+          # $cppconnDll = Find-FirstFile -Roots $triplets -Patterns @('mysqlcppconn-10-vs14.dll', 'mysqlcppconn8-*.dll', 'mysqlcppconn*.dll')
+          # if ($cppconnDll) {
+          #   Write-Output "TACOSALAD: $bundle\bin\ $cppconnDll"
+          #   Copy-Item -Path $cppconnDll -Destination "$bundle\bin\mysqlcppconn-10-vs14.dll" -Force
+          # }
+
+          $classicDll = Get-ChildItem -Recurse "D:\a\_temp\vcpkg\installed\x64-windows" `
+            -Filter "mysqlcppconn-*-vs14.dll" |
+            Select-Object -First 1 -ExpandProperty FullName
+
+          if ($classicDll) {
+            Copy-Item $classicDll "$bundle\bin\" -Force
+          }
+
+          # # Build a tiny compatibility shim if the legacy vsqlite++ import library is missing.
+          # # The repo links against vsqlite++.lib, but no vsqlite++ source exists here.
+          # if (!(Test-Path "$bundle\lib\vsqlite++.lib")) {
+          #   $shimDir = Join-Path $env:RUNNER_TEMP 'vsqlite-shim'
+          #   New-Item -ItemType Directory -Force -Path $shimDir | Out-Null
+
+          #   @'
+          # #include <windows.h>
+          # extern "C" __declspec(dllexport) void wb_vsqlite_placeholder(void) {}
+          # BOOL APIENTRY DllMain(void* hModule, unsigned long ul_reason_for_call, void* lpReserved) { return 1; }
+          # '@ | Set-Content -Path (Join-Path $shimDir 'vsqlite_shim.cpp') -Encoding ASCII
+
+          #   & cl.exe /nologo /LD /EHsc /Fe:"$shimDir\vsqlite++.dll" "$shimDir\vsqlite_shim.cpp" /link /IMPLIB:"$shimDir\vsqlite++.lib"
+          #   Copy-Item -Path "$shimDir\vsqlite++.lib" -Destination "$bundle\lib\vsqlite++.lib" -Force
+          #   Copy-Item -Path "$shimDir\vsqlite++.dll" -Destination "$bundle\lib\vsqlite++.dll" -Force
+          # }
+
+          # Avoid:  D:\a\_temp\wb-3rdparty\include\boost\assert\source_location.hpp(98,9): error C2039: '_snprintf_s': is not a member of 'std'
+          $boostHdr = "D:\a\_temp\vcpkg\installed\x64-windows\include\boost\assert\source_location.hpp"
+          Write-Output "-- Taco3 --"
+          (Get-Content $boostHdr) `
+            -replace 'std::snprintf', 'snprintf' `
+            | Set-Content $boostHdr
+          # Write-Output (Get-Content $boostHdr)
+          Write-Output "-- Taco4 --"
+          $boostHdr = "D:\a\_temp\vcpkg\installed\x64-windows-static\include\boost\assert\source_location.hpp"
+          (Get-Content $boostHdr) `
+            -replace 'std::snprintf', 'snprintf' `
+            | Set-Content $boostHdr
+          # Write-Output (Get-Content $boostHdr)
+          Write-Output "-- Taco5 --"
+          $boostHdr = "D:\a\_temp\wb-3rdparty\include\boost\assert\source_location.hpp"
+          (Get-Content $boostHdr) `
+            -replace 'std::snprintf', 'snprintf' `
+            | Set-Content $boostHdr
+          # Write-Output (Get-Content $boostHdr)
+          Write-Output "-- Taco6 --"
+
+          # # Avoid:  D:\a\mysql-workbench\mysql-workbench\library\forms\swig\cairo_wrap.cxx(5422,53): error C2660: 'SWIG_Python_AppendOutput': function does not take 2 arguments
+          # $swigWrap = "D:\a\mysql-workbench\mysql-workbench\library\forms\swig\cairo_wrap.cxx"
+          # (Get-Content $swigWrap) `
+          #   -replace 'SWIG_Python_AppendOutput\(([^,]+),\s*([^)]+)\)', 'SWIG_AppendOutput($1, $2)' `
+          #   | Set-Content $swigWrap
+
+          @"
+          WB_3DPARTY_PATH assembled at $bundle
+
+          Notes:
+          - vcpkg provided the bulk of the native headers and libraries.
+          - setup-python provided the Python 3.12 embed headers, import library, stdlib, and DLLs.
+          - HtmlRenderer.dll came from NuGet.
+          - vsqlite++ was shimmed only because this repository does not contain its source.
+          - Runtime-only copies performed later by PrepareOutputDir.cmd remain best-effort.
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      - name: Find static library for database connectivity dependencies
+        shell: pwsh
+        run: |
+          Write-Output "-- TACO --"
+          # Get-ChildItem -Recurse D:\a\_temp -Filter result.hpp | Select-Object FullName
+          # Get-ChildItem -Recurse D:\a\_temp -Filter execute.hpp | Select-Object FullName
+          # Get-ChildItem -Recurse D:\a\_temp -Filter database_exception.hpp | Select-Object FullName
+          Get-ChildItem -Recurse D:\a\_temp -Filter mysql_connection.h | Select-Object FullName
+          Write-Output "-- TACO --"
+          # Get-ChildItem -Recurse "D:\a\_temp\vcpkg\installed\x64-windows-static" -Include *.lib |
+          #   Where-Object { $_.Name -match 'mysqlcppconn|jdbc' } |
+          #   Select-Object FullName, Name
+
+      - name: Build Release x64
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          msbuild $env:SOLUTION_FILE `
+            /m `
+            /p:Configuration=$env:CONFIGURATION `
+            /p:Platform=$env:PLATFORM `
+            /p:WB_3DPARTY_PATH="$env:WB_3DPARTY_PATH" `
+            /p:AdditionalIncludeDirectories="$env:WB_3DPARTY_PATH" `
+            /p:AdditionalIncludeDirectories="$env:WB_3DPARTY_PATH\jdbc" `
+            /p:AdditionalIncludeDirectories="D:\a\_temp\wb-3rdparty\include" `
+            /verbosity:minimal
+
+      # - name: Show output folders when build fails
+      #   if: failure()
+      #   shell: pwsh
+      #   run: |
+      #     Write-Host "bin tree:"
+      #     Get-ChildItem -Path bin -Recurse -ErrorAction SilentlyContinue | Select-Object FullName
+
+      #     Write-Host "obj tree:"
+      #     Get-ChildItem -Path obj -Recurse -ErrorAction SilentlyContinue | Select-Object FullName
+
+      - name: Verify expected output
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $expected = "bin\$env:PLATFORM\$env:CONFIGURATION\MySQLWorkbench.exe"
+          if (!(Test-Path $expected)) {
+            throw "Build finished but expected executable was not found at $expected"
+          }
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MySQLWorkbench-${{ env.CONFIGURATION }}-${{ env.PLATFORM }}
+          path: bin/${{ env.PLATFORM }}/${{ env.CONFIGURATION }}/
+          if-no-files-found: error
