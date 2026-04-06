@@ -1,0 +1,101 @@
+name: build_assets
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-windows-x64-release:
+    runs-on: windows-2022
+
+    env:
+      BUILD_TYPE: Release
+      BUILD_DIR: ${{ github.workspace }}\build
+      INSTALL_DIR: ${{ github.workspace }}\install
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install build tools
+        shell: pwsh
+        run: |
+          choco install winflexbison3 -y
+          choco install ninja -y
+          choco install strawberryperl -y
+
+      - name: Show tool versions
+        shell: pwsh
+        run: |
+          cmake --version
+          ninja --version
+          perl -v
+          win_bison --version
+          win_flex --version
+          cl
+
+      - name: Fetch and unpack Boost 1.77.0
+        shell: pwsh
+        run: |
+          $boostRoot = "$env:RUNNER_TEMP\my_boost"
+          $boostZip  = "$env:RUNNER_TEMP\boost_1_77_0.zip"
+          $boostUrl  = "https://sourceforge.net/projects/boost/files/boost/1.77.0/boost_1_77_0.zip/download"
+          New-Item -ItemType Directory -Force -Path $boostRoot | Out-Null
+          Invoke-WebRequest -Uri $boostUrl -OutFile $boostZip
+          Expand-Archive -Path $boostZip -DestinationPath $boostRoot -Force
+          $extracted = Join-Path $boostRoot "boost_1_77_0"
+          if (!(Test-Path $extracted)) {
+            throw "Boost did not extract to expected folder: $extracted"
+          }
+          "BOOST_ROOT=$extracted" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S . -B "$env:BUILD_DIR" -G "Ninja" -DCMAKE_BUILD_TYPE=$env:BUILD_TYPE -DCMAKE_INSTALL_PREFIX="$env:INSTALL_DIR" -DWITH_UNIT_TESTS=OFF -DWITH_ROUTER=OFF -DWITH_BOOST=$env:BOOST_ROOT -DDOWNLOAD_BOOST=0
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake --build "$env:BUILD_DIR" --parallel
+
+      - name: Install
+        shell: pwsh
+        run: |
+          cmake --install "$env:BUILD_DIR"
+
+      - name: Verify key binaries
+        shell: pwsh
+        run: |
+          $expected = @(
+            "$env:INSTALL_DIR\bin\mysqld.exe",
+            "$env:INSTALL_DIR\bin\mysql.exe"
+          )
+
+          foreach ($file in $expected) {
+            if (!(Test-Path $file)) {
+              throw "Missing expected file: $file"
+            }
+          }
+
+      - name: Package artifact
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:GITHUB_WORKSPACE "mysql-server-windows-x64-release.zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Compress-Archive -Path "$env:INSTALL_DIR\*" -DestinationPath $zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mysql-server-windows-x64-release
+          path: mysql-server-windows-x64-release.zip
+          if-no-files-found: error
