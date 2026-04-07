@@ -25,6 +25,19 @@ jobs:
         with:
           arch: x64
 
+      - name: Install OpenSSL
+        shell: pwsh
+        run: |
+          choco install openssl --version=3.6.1 -y --no-progress --install-arguments '"/DIR=D:\a\mysql-gha\OpenSSL"'
+          # --params "/InstallDir:D:\a\mysql-gha\OpenSSL"
+          Write-Output "TACO1"
+          Get-ChildItem -Path "D:\a\mysql-gha\OpenSSL"
+          # -Directory | Select-Object -First 1 -ExpandProperty FullName
+          # Write-Output "TACO2"
+          # Get-ChildItem -Path "D:\a\mysql-gha\OpenSSL\lib"
+          # -Directory | Select-Object -First 1 -ExpandProperty FullName
+          Write-Output "TACO3"
+
       - name: Install build tools
         shell: pwsh
         run: |
@@ -78,18 +91,14 @@ jobs:
 
           "BOOST_ROOT=$boostDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Install OpenSSL
-        shell: pwsh
-        run: choco install openssl --version=3.6.1 -y --no-progress
-
       - name: Configure
         shell: pwsh
         run: |
-          $env:OPENSSL_LIB_DIR = 'C:/Program Files/OpenSSL'
+          $env:OPENSSL_LIB_DIR = 'D:/a/mysql-gha/OpenSSL'
           cmake -S . -B "$env:BUILD_DIR" -G "Ninja" -DCMAKE_BUILD_TYPE="$env:BUILD_TYPE" -DCMAKE_INSTALL_PREFIX="$env:INSTALL_DIR" -DWITH_UNIT_TESTS=OFF -DWITH_ROUTER=OFF -DWITH_BOOST=D:\a\_temp\boost_1_77_0.zip -DDOWNLOAD_BOOST=0 `
-            -DWITH_SSL="C:/Program Files/OpenSSL" `
-            -DOPENSSL_LIBRARY="C:/Program Files/OpenSSL/lib/VC/x64/MD/libssl.lib" `
-            -DCRYPTO_LIBRARY="C:/Program Files/OpenSSL/lib/VC/x64/MD/libcrypto.lib"
+            -DWITH_SSL="D:/a/mysql-gha/OpenSSL" `
+            -DOPENSSL_LIBRARY="D:/a/mysql-gha/OpenSSL/lib/VC/x64/MD/libssl.lib" `
+            -DCRYPTO_LIBRARY="D:/a/mysql-gha/OpenSSL/lib/VC/x64/MD/libcrypto.lib"
 
       - name: Build
         shell: pwsh
