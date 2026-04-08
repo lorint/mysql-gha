@@ -103,12 +103,15 @@ jobs:
       - name: Build
         shell: pwsh
         run: |
-          cmake --build "$env:BUILD_DIR" --parallel
+          cmake --build "$env:BUILD_DIR" --config Release --parallel
+          # --prefix "$env:BUILD_DIR"
+          cmake --install build --prefix "$env:BUILD_DIR"
 
       - name: Install
         shell: pwsh
         run: |
-          cmake --install "$env:BUILD_DIR"
+          $env:INSTALL_DIR = "D:\a\mysql-gha\mysql-gha\INSTALL"
+          cmake --install "$env:INSTALL_DIR"
 
       - name: Verify key binaries
         shell: pwsh
